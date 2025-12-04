@@ -1,126 +1,204 @@
 import json
+import os
+import glob
+import pandas as pd
 from typing import Dict, Any, List, Optional
 
-def extract_data_from_match_file(file_path: str) -> Optional[Dict[str, Any]]:
-    """
-    Reads a JSON file containing cricket match data and extracts key information.
+# --- 1. CORE STATISTICAL ANALYSIS FUNCTION ---
 
-    Args:
-        file_path: The full path to the cricket match data file (e.g., '1473503.json').
-
-    Returns:
-        A dictionary containing the extracted match data, or None if an error occurs.
+def _analyze_innings_deliveries(innings: Dict[str, Any], match_id: str, innings_number: int) -> List[Dict[str, Any]]:
     """
+    Analyzes deliveries to compile comprehensive batting and bowling statistics,
+    and returns a list of dictionaries (one row per player) suitable for flattening.
+    """
+    batting_stats = {}
+    bowling_stats = {}
+    total_balls = 0
+
+    # --- Pass 1: Gather Stats ---
+    for over_data in innings.get('overs', []):
+        for delivery in over_data.get('deliveries', []):
+
+            batter = delivery.get('batter')
+            bowler = delivery.get('bowler')
+            runs_data = delivery.get('runs', {})
+            extras_data = delivery.get('extras', {})
+            wickets_data = delivery.get('wickets')
+
+            is_valid_ball = 'wides' not in extras_data and 'noballs' not in extras_data
+            if is_valid_ball:
+                total_balls += 1
+
+            # Init and update batter stats
+            if batter:
+                batting_stats.setdefault(batter, {'runs': 0, 'balls_faced': 0, '4s': 0, '6s': 0, 'dismissal': None, 'out_by': None, 'is_bowling': False})
+                batting_stats[batter]['runs'] += runs_data.get('batter', 0)
+                if is_valid_ball: batting_stats[batter]['balls_faced'] += 1
+                runs_scored = runs_data.get('batter', 0)
+                if runs_scored == 4: batting_stats[batter]['4s'] += 1
+                elif runs_scored == 6: batting_stats[batter]['6s'] += 1
+
+                if wickets_data and wickets_data[0].get('player_out') == batter:
+                    batting_stats[batter]['dismissal'] = wickets_data[0].get('kind')
+                    fielder_name = wickets_data[0].get('fielders', [{}])[0].get('name')
+                    batting_stats[batter]['out_by'] = fielder_name or bowler
+
+            # Init and update bowler stats
+            if bowler:
+                bowling_stats.setdefault(bowler, {'runs_conceded': 0, 'balls_bowled': 0, 'wickets': 0, 'extras': 0, 'is_batting': False})
+                batting_stats.setdefault(bowler, {'is_bowling': False}) # Ensure bowler is initialized in batting map for the combined list later
+
+                bowler_runs = runs_data.get('total', 0) - extras_data.get('byes', 0) - extras_data.get('legbyes', 0)
+                bowling_stats[bowler]['runs_conceded'] += bowler_runs
+                bowling_stats[bowler]['extras'] += runs_data.get('extras', 0)
+
+                if is_valid_ball: bowling_stats[bowler]['balls_bowled'] += 1
+
+                if wickets_data:
+                    kind = wickets_data[0].get('kind')
+                    is_bowler_wicket = kind in ['caught', 'bowled', 'lbw', 'stumped', 'hit wicket']
+                    if is_bowler_wicket: bowling_stats[bowler]['wickets'] += 1
+
+                # Mark player as a bowler in the bowling map
+                bowling_stats[bowler]['is_batting'] = True
+
+    # --- Pass 2: Combine and Finalize Data ---
+
+    # Identify all unique players involved in this innings (batting or bowling)
+    all_players = set(batting_stats.keys()) | set(bowling_stats.keys())
+
+    # Prepare list of dictionaries for the DataFrame
+    innings_rows = []
+    team_name = innings.get('team')
+
+    for player in all_players:
+        b_stats = batting_stats.get(player, {})
+        w_stats = bowling_stats.get(player, {})
+
+        balls_faced = b_stats.get('balls_faced', 0)
+        balls_bowled = w_stats.get('balls_bowled', 0)
+        runs_scored = b_stats.get('runs', 0)
+        runs_conceded = w_stats.get('runs_conceded', 0)
+
+        row = {
+            # Match & Innings Identifiers
+            'match_id': match_id,
+            'innings_number': innings_number,
+            'innings_team': team_name,
+            'player_name': player,
+
+            # Batting Stats
+            'bat_runs': runs_scored,
+            'bat_balls_faced': balls_faced,
+            'bat_4s': b_stats.get('4s', 0),
+            'bat_6s': b_stats.get('6s', 0),
+            'bat_sr': round((runs_scored / balls_faced) * 100, 2) if balls_faced > 0 else 0,
+            'bat_dismissal': b_stats.get('dismissal'),
+            'bat_out_by': b_stats.get('out_by'),
+
+            # Bowling Stats
+            'bowl_runs_conceded': runs_conceded,
+            'bowl_wickets': w_stats.get('wickets', 0),
+            'bowl_balls_bowled': balls_bowled,
+            'bowl_overs': f"{balls_bowled // 6}.{balls_bowled % 6}",
+            'bowl_economy': round((runs_conceded / balls_bowled) * 6, 2) if balls_bowled > 0 else 0,
+            'bowl_extras': w_stats.get('extras', 0),
+        }
+        innings_rows.append(row)
+
+    return innings_rows
+
+# --- 2. SINGLE FILE PROCESSING FUNCTION ---
+
+def extract_data_from_match_file(file_path: str) -> Optional[List[Dict[str, Any]]]:
+    """Reads a single cricket match JSON file and extracts all data rows."""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-    except FileNotFoundError:
-        print(f"Error: File not found at {file_path}")
-        return None
-    except json.JSONDecodeError:
-        print(f"Error: Invalid JSON format in {file_path}")
-        return None
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"❌ Error reading or parsing file {file_path}: {e}")
         return None
 
-    if not data or 'info' not in data or 'innings' not in data:
-        print(f"Error: Missing essential keys in the data from {file_path}")
-        return None
+    info = data.get('info', {})
 
-    info = data['info']
-    innings: List[Dict[str, Any]] = data['innings']
-
-    # --- 1. Extract Basic Match Information ---
+    # Extract high-level match data once
     match_data = {
-        'file_name': file_path,
-        'date': info.get('dates', [])[0] if info.get('dates') else None,
-        'event_name': info.get('event', {}).get('name'),
-        'match_number': info.get('event', {}).get('match_number'),
-        'teams': info.get('teams', []),
+        'file_name': os.path.basename(file_path),
+        'match_id': info.get('event', {}).get('match_number', os.path.basename(file_path).split('.')[0]),
+        'date': info.get('dates', ['Unknown'])[0],
         'venue': info.get('venue'),
-        'city': info.get('city'),
+        'team_1': info.get('teams', [''])[0],
+        'team_2': info.get('teams', [''])[1],
         'toss_winner': info.get('toss', {}).get('winner'),
-        'toss_decision': info.get('toss', {}).get('decision'),
         'result_winner': info.get('outcome', {}).get('winner'),
-        'result_by': info.get('outcome', {}).get('by'),
-        'player_of_match': info.get('player_of_match', []),
-        'innings_summary': []
+        'player_of_match': ', '.join(info.get('player_of_match', [])),
     }
 
-    # --- 2. Process Innings Data ---
-    for inning in innings:
-        team_name = inning.get('team')
-        total_runs = 0
-        total_extras = 0
-        wickets_lost = 0
+    all_player_rows = []
 
-        for over in inning.get('overs', []):
-            for delivery in over.get('deliveries', []):
-                # Calculate total runs for the inning
-                total_runs += delivery.get('runs', {}).get('total', 0)
-                # Calculate extras (runs - batter runs)
-                total_extras += delivery.get('runs', {}).get('extras', 0)
-                # Count wickets
-                if delivery.get('wickets'):
-                    wickets_lost += len(delivery['wickets'])
+    # Process each innings
+    for i, inning in enumerate(data.get('innings', [])):
+        # Get list of player rows for this inning
+        player_rows = _analyze_innings_deliveries(inning, match_data['match_id'], i + 1)
 
-        # Subtract extras from total_runs to get runs scored *by the bat*
-        runs_from_bat = total_runs - total_extras
+        # Merge high-level match data into each player row
+        for row in player_rows:
+            row.update(match_data)
+            all_player_rows.append(row)
 
-        innings_summary = {
-            'team': team_name,
-            'total_score': total_runs,
-            'wickets_lost': wickets_lost,
-            'runs_from_bat': runs_from_bat,
-            'extras': total_extras,
-            'overs_bowled': len(inning.get('overs', [])) # Approximate overs count
-        }
-        match_data['innings_summary'].append(innings_summary)
+    return all_player_rows
 
-    return match_data
+# --- 3. BULK PROCESSING AND MAIN EXECUTION ---
 
-# --- Example Usage for a single file ---
-
-FILE_TO_ANALYZE = '1473503.json'
-
-# NOTE: You would need to replace this with the actual path if the file is not 
-# in the same directory as the script.
-extracted_data = extract_data_from_match_file(FILE_TO_ANALYZE)
-
-if extracted_data:
-    print(json.dumps(extracted_data, indent=4))
-    print("\n--- Summary ---")
-    print(f"Match: {extracted_data['event_name']} Match {extracted_data['match_number']}")
-    print(f"Venue: {extracted_data['venue']}")
-    print(f"Toss Winner: {extracted_data['toss_winner']} (Chose to {extracted_data['toss_decision']})")
-    print(f"Winner: {extracted_data['result_winner']} by {extracted_data['result_by']}")
-    print(f"Player of the Match: {', '.join(extracted_data['player_of_match'])}")
-    print("\nInnings Scores:")
-    for inning in extracted_data['innings_summary']:
-        print(f"  {inning['team']}: {inning['total_score']}/{inning['wickets_lost']} in approximately {inning['overs_bowled']} overs")
-
-
-# --- Function to process multiple files ---
-
-def process_multiple_files(file_list: List[str]) -> List[Dict[str, Any]]:
+def process_all_files_to_csv(directory_path: str, output_csv_file: str):
     """
-    Processes a list of match files and returns a list of extracted data dictionaries.
-
-    Args:
-        file_list: A list of file paths (e.g., ['1.json', '2.json', ...]).
-
-    Returns:
-        A list of dictionaries containing the extracted data for all successfully processed matches.
+    Dynamically finds all JSON files in the specified directory, processes them,
+    and saves the combined data to a single CSV file.
     """
-    all_match_data = []
-    for file_path in file_list:
-        data = extract_data_from_match_file(file_path)
-        if data:
-            all_match_data.append(data)
-    return all_match_data
+    # Use glob to find all files ending with .json in the directory
+    # IMPORTANT: Ensure the directory_path is correct for your setup.
+    file_paths = glob.glob(os.path.join(directory_path, '*.json'))
 
-# Example of how you would list your 1169 files:
-# file_paths = [f"{i}.json" for i in range(1, 1170)] 
-# all_data = process_multiple_files(file_paths)
-# print(f"Successfully processed {len(all_data)} files.")
+    if not file_paths:
+        print(f"⚠️ No JSON files found in the directory: {directory_path}. Please check the path.")
+        return
+
+    print(f"Starting analysis. Found {len(file_paths)} files to process in '{directory_path}'.")
+
+    combined_data = []
+
+    for i, path in enumerate(file_paths):
+        # Progress indicator
+        if (i + 1) % 100 == 0:
+            print(f"✅ Processed {i + 1} of {len(file_paths)} files...")
+
+        player_rows = extract_data_from_match_file(path)
+        if player_rows:
+            combined_data.extend(player_rows)
+
+    if not combined_data:
+        print("❌ No data was successfully extracted. CSV file will not be created.")
+        return
+
+    # Convert the list of dictionaries into a pandas DataFrame
+    df = pd.DataFrame(combined_data)
+
+    # Save the DataFrame to a CSV file
+    df.to_csv(output_csv_file, index=False, encoding='utf-8')
+
+    print(f"\n--- Analysis Complete! ---")
+    print(f"Data successfully compiled into {len(df)} rows and saved to: {output_csv_file}")
+
+
+# --- DYNAMIC SETUP ---
+# 1. IMPORTANT: Set the path to the folder containing your 1169 JSON files.
+#    If the files are in a folder named 'cricket_data' in the same directory as this script:
+#    DATA_DIRECTORY_PATH = 'cricket_data'
+#    For the purpose of testing with the single file you uploaded, we use '.' (current directory).
+DATA_DIRECTORY_PATH = '.'
+
+# 2. Define the name of the final output CSV file.
+OUTPUT_CSV_FILE = 'cricket_match_data.csv'
+
+# 3. Execute the main processing function
+process_all_files_to_csv(DATA_DIRECTORY_PATH, OUTPUT_CSV_FILE)
